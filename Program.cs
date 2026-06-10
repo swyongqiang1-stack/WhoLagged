@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using Microsoft.Diagnostics.Tracing.Session;
@@ -8,22 +7,22 @@ namespace StutterFix;
 
 class Program
 {
-    static async Task Main(string[] args)
+    static async Task Main()
     {
-        Console.OutputEncoding = System.Text.Encoding.UTF8;
-        if (!IsAdministrator())
+        // 权限检查：明确未提权时才提示
+        if (TraceEventSession.IsElevated() == false)
         {
-            Console.WriteLine("Please run as Administrator (right-click -> Run as Administrator)");
+            Console.WriteLine("Please run as Administrator.");
             Console.ReadKey();
             return;
         }
 
-        Console.WriteLine("===== StutterFix - Find what's causing lag =====");
-        Console.WriteLine("Analyzing... Please wait 10 seconds (keep your PC in laggy state).");
-        Console.WriteLine("Press Ctrl+C to cancel early.");
+        Console.WriteLine("===== StutterFix - Find the software causing lag =====");
+        Console.WriteLine("Sampling for 10 seconds... (Keep your PC in laggy state)");
+        Console.WriteLine("Press Ctrl+C to cancel early.\n");
 
-        using var cts = new CancellationTokenSource();
-        Console.CancelKeyPress += (sender, e) =>
+        var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (s, e) =>
         {
             e.Cancel = true;
             cts.Cancel();
@@ -32,10 +31,9 @@ class Program
 
         try
         {
-            var data = await CollectKernelDataAsync(TimeSpan.FromSeconds(10), cts.Token);
-            var conclusion = Analyze(data);
+            var result = await CollectAndAnalyzeAsync(TimeSpan.FromSeconds(10), cts.Token);
             Console.WriteLine("\n===== DIAGNOSIS =====");
-            Console.WriteLine(conclusion);
+            Console.WriteLine(result);
         }
         catch (OperationCanceledException)
         {
@@ -44,430 +42,184 @@ class Program
         catch (Exception ex)
         {
             Console.WriteLine($"\nERROR: {ex.Message}");
-            Console.WriteLine("Close other performance tools (LatencyMon, WPR, etc.) and try again.");
+            Console.WriteLine("Close other monitoring tools (LatencyMon, WPR, etc.) and try again.");
         }
 
-        Console.WriteLine("\nPress any key to exit...");
+        Console.WriteLine("\nPress any key to exit.");
         Console.ReadKey();
     }
 
-    // 枚举已加载驱动（通过 P/Invoke）
-    private static List<(ulong Base, ulong End, string Name)> EnumerateLoadedDrivers()
+    static async Task<string> CollectAndAnalyzeAsync(TimeSpan duration, CancellationToken token)
     {
-        var result = new List<(ulong, ulong, string)>();
-        const int arraySize = 1024;
-        IntPtr[] imageBaseArray = new IntPtr[arraySize];
-        int bytesNeeded = 0;
+        // 聚合数据结构
+        var ctxCountByProcess = new Dictionary<int, long>();       // PID -> 上下文切换次数
+        var dpcCountByDriver = new Dictionary<string, long>();     // 驱动名 -> DPC 次数
+        var diskLatencyByProcess = new Dictionary<int, double>();  // PID -> 磁盘延迟总和(ms)
+        var processNames = new Dictionary<int, string>();          // PID -> 进程名
 
-        if (!NativeMethods.EnumDeviceDrivers(imageBaseArray, arraySize * IntPtr.Size, ref bytesNeeded))
-            return result;
+        // 驱动地址映射（实时维护，ImageLoad/DCStart 事件会动态添加）
+        var driverMap = new Dictionary<ulong, (ulong End, string Name)>();
 
-        int driverCount = bytesNeeded / IntPtr.Size;
-        for (int i = 0; i < driverCount; i++)
+        // ----- 创建会话并启用内核提供程序 -----
+        using var session = new TraceEventSession(KernelTraceEventParser.KernelSessionName, TraceEventSessionOptions.Create);
+        session.EnableKernelProvider(
+            KernelTraceEventParser.Keywords.ContextSwitch |
+            KernelTraceEventParser.Keywords.DPC |
+            KernelTraceEventParser.Keywords.DiskIO |
+            KernelTraceEventParser.Keywords.ImageLoad
+        );
+
+        var parser = new KernelTraceEventParser(session.Source);
+
+        // ----- 事件回调 -----
+
+        // 1. 模块加载（构建驱动地址映射，过滤空名称）
+        void OnImageLoad(ImageLoadTraceData evt)
         {
-            IntPtr baseAddr = imageBaseArray[i];
-            byte[] fileNameBuffer = new byte[1024];
-            if (NativeMethods.GetDeviceDriverFileName(baseAddr, fileNameBuffer, fileNameBuffer.Length) && fileNameBuffer[0] != 0)
+            if (evt.ImageBase == 0 || evt.ImageSize <= 0 || string.IsNullOrEmpty(evt.FileName))
+                return;
+            string driverName = Path.GetFileName(evt.FileName);
+            if (string.IsNullOrEmpty(driverName))
+                return;                                      // 拒绝空名称
+            ulong end = evt.ImageBase + (ulong)evt.ImageSize;
+            driverMap[evt.ImageBase] = (end, driverName);    // 自动去重
+        }
+        parser.ImageLoad += OnImageLoad;
+        parser.ImageDCStart += OnImageLoad;                  // 已加载的驱动也会触发
+
+        // 2. 上下文切换
+        parser.CSwitch += (CSwitchTraceData evt) =>
+        {
+            int pid = evt.OldProcessID;
+            if (pid > 0)
             {
-                string fullPath = System.Text.Encoding.ASCII.GetString(fileNameBuffer).TrimEnd('\0');
-                string driverName = Path.GetFileName(fullPath);
-                // 获取驱动大小（需要另外 API，暂用 0 表示，后续可通过 module load 事件补充）
-                // 这里简单起见，大小设为0，地址范围只有基址，无法精确匹配；但我们会优先使用模块加载事件，
-                // 枚举的驱动作为后备映射（只用于没有 ImageLoad 事件的老驱动）。
-                // 更精确的大小可通过 NtQuerySystemInformation 或 GetDeviceDriverBaseName 配合读取 PE 头，但复杂度高。
-                // 为简化，我们只在地址比较时使用基址匹配，不比较大小，并接受可能的误匹配（概率低）。
-                result.Add(((ulong)baseAddr, 0, driverName));
+                ctxCountByProcess.TryGetValue(pid, out long cur);
+                ctxCountByProcess[pid] = cur + 1;
+
+                if (!processNames.ContainsKey(pid) && !string.IsNullOrEmpty(evt.ProcessName))
+                    processNames[pid] = evt.ProcessName;
+            }
+        };
+
+        // 3. 磁盘 I/O（只累加延迟，不记录路径）
+        void OnDiskIO(DiskIOTraceData evt)
+        {
+            if (evt.ProcessID > 0 && evt.ElapsedTimeMSec > 1.0)
+            {
+                diskLatencyByProcess.TryGetValue(evt.ProcessID, out double cur);
+                diskLatencyByProcess[evt.ProcessID] = cur + evt.ElapsedTimeMSec;
+
+                if (!processNames.ContainsKey(evt.ProcessID) && !string.IsNullOrEmpty(evt.ProcessName))
+                    processNames[evt.ProcessID] = evt.ProcessName;
             }
         }
-        return result;
-    }
+        parser.DiskIORead += OnDiskIO;
+        parser.DiskIOWrite += OnDiskIO;
 
-    private static async Task<KernelData> CollectKernelDataAsync(TimeSpan duration, CancellationToken token)
-    {
-        var data = new KernelData();
-        TraceEventSession? session = null;
-
-        // 采集前枚举已加载驱动（作为初始映射）
-        var preloadedDrivers = EnumerateLoadedDrivers();
-        // 构建驱动地址映射列表（基址 -> 驱动名），稍后会与模块加载事件合并
-        var driverMappings = new List<(ulong Base, ulong End, string Name)>();
-        foreach (var drv in preloadedDrivers)
+        // 4. DPC：实时遍历 driverMap 匹配驱动名（线性扫描，适合数百个驱动的场景）
+        parser.DPC += (DPCTraceData evt) =>
         {
-            driverMappings.Add((drv.Base, drv.End, drv.Name));
-        }
+            ulong addr = evt.Routine;
+            if (addr == 0) return;
+
+            string? driver = null;
+            foreach (var kv in driverMap)
+            {
+                if (addr >= kv.Key && addr < kv.Value.End)
+                {
+                    driver = kv.Value.Name;
+                    break;
+                }
+            }
+
+            if (driver != null)
+            {
+                dpcCountByDriver.TryGetValue(driver, out long cur);
+                dpcCountByDriver[driver] = cur + 1;
+            }
+        };
+
+        // 启动事件处理线程
+        var processTask = Task.Run(() => session.Source.Process(), token);
 
         try
         {
-            session = new TraceEventSession(KernelTraceEventParser.KernelSessionName, TraceEventSessionOptions.Create);
-        }
-        catch (Exception ex)
-        {
-            throw new Exception($"Failed to start ETW session: {ex.Message}. Close other monitoring tools.", ex);
-        }
-
-        using (session)
-        {
-            // 启用内核事件（增加 Interrupt 关键词）
-            session.EnableKernelProvider(
-                KernelTraceEventParser.Keywords.ContextSwitch |
-                KernelTraceEventParser.Keywords.DPC |
-                KernelTraceEventParser.Keywords.Interrupt |
-                KernelTraceEventParser.Keywords.Process |
-                KernelTraceEventParser.Keywords.Thread |
-                KernelTraceEventParser.Keywords.DiskIO |
-                KernelTraceEventParser.Keywords.ImageLoad
-            );
-
-            var parser = new KernelTraceEventParser(session.Source);
-
-            var processStartEvents = new List<ProcessTraceData>();
-            var contextSwitchEvents = new List<ContextSwitchTraceData>();
-            var dpcEvents = new List<DPCTraceData>();
-            var interruptEvents = new List<InterruptTraceData>();
-            var diskIOReadEvents = new List<DiskIOReadTraceData>();
-            var diskIOWriteEvents = new List<DiskIOWriteTraceData>();
-            var moduleLoadEvents = new List<ModuleLoadTraceData>();
-
-            parser.ProcessStartup += evt => { lock (processStartEvents) processStartEvents.Add(evt.Clone()); };
-            parser.ContextSwitch += evt => { lock (contextSwitchEvents) contextSwitchEvents.Add(evt.Clone()); };
-            parser.DPC += evt => { lock (dpcEvents) dpcEvents.Add(evt.Clone()); };
-            parser.Interrupt += evt => { lock (interruptEvents) interruptEvents.Add(evt.Clone()); };
-            parser.DiskIORead += evt => { lock (diskIOReadEvents) diskIOReadEvents.Add(evt.Clone()); };
-            parser.DiskIOWrite += evt => { lock (diskIOWriteEvents) diskIOWriteEvents.Add(evt.Clone()); };
-            parser.ModuleLoad += evt => { lock (moduleLoadEvents) moduleLoadEvents.Add(evt.Clone()); };
-
-            var processTask = Task.Run(() => session.Source.Process(), token);
             await Task.Delay(duration, token);
+        }
+        finally
+        {
+            // 确保取消或异常时也能正确停止会话
             session.Stop();
+            try { await processTask; } catch (OperationCanceledException) { }
+        }
 
+        // ----- 分析阶段 -----
+        double sec = duration.TotalSeconds;
+
+        // 辅助函数：安全获取进程描述（诊断时才获取路径，避免高频回调中开销过大）
+        string GetProcessDescription(int pid)
+        {
+            if (pid == 0) return "System Idle Process";
+            if (pid == 4) return "System (Kernel)";
+
+            string name = processNames.TryGetValue(pid, out var n) ? n : $"PID {pid}";
+            string path = "";
             try
             {
-                await processTask;
+                using var p = Process.GetProcessById(pid);
+                path = p.MainModule?.FileName ?? "";
+                if (!processNames.ContainsKey(pid))
+                    name = p.ProcessName;
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Warning: ETW processing stopped early: {ex.Message}");
-            }
+            catch { } // 权限不足或进程已退出时忽略
 
-            // ---------- 离线处理 ----------
-            // 合并模块加载事件到驱动映射（优先使用模块事件的基址和大小）
-            foreach (var evt in moduleLoadEvents)
-            {
-                if (evt.ImageBase.HasValue && evt.ImageSize.HasValue && evt.ImageSize.Value > 0 && !string.IsNullOrEmpty(evt.ModuleName))
-                {
-                    ulong baseAddr = evt.ImageBase.Value;
-                    ulong endAddr = baseAddr + evt.ImageSize.Value;
-                    string name = Path.GetFileName(evt.ModuleName);
-                    // 去重：如果已有相同基址的映射，替换（新的事件更准确）
-                    int idx = driverMappings.FindIndex(m => m.Base == baseAddr);
-                    if (idx >= 0)
-                        driverMappings[idx] = (baseAddr, endAddr, name);
-                    else
-                        driverMappings.Add((baseAddr, endAddr, name));
-                }
-            }
-
-            // 进程名称和路径（去重）
-            var processNames = new Dictionary<int, string>();
-            var processPaths = new Dictionary<int, string>();
-            var seenPids = new HashSet<int>();
-            foreach (var evt in processStartEvents)
-            {
-                int pid = evt.ProcessID;
-                if (!string.IsNullOrEmpty(evt.ProcessName) && !processNames.ContainsKey(pid))
-                    processNames[pid] = evt.ProcessName;
-
-                if (!seenPids.Contains(pid))
-                {
-                    seenPids.Add(pid);
-                    try
-                    {
-                        using var p = Process.GetProcessById(pid);
-                        processPaths[pid] = p.MainModule?.FileName ?? "";
-                    }
-                    catch { }
-                }
-            }
-
-            // 线程到进程映射
-            var threadToProcess = new Dictionary<int, int>();
-            foreach (var evt in contextSwitchEvents)
-            {
-                if (evt.OldThreadID > 0 && evt.OldProcessID > 0 && !threadToProcess.ContainsKey(evt.OldThreadID))
-                    threadToProcess[evt.OldThreadID] = evt.OldProcessID;
-                if (evt.NewThreadID > 0 && evt.NewProcessID > 0 && !threadToProcess.ContainsKey(evt.NewThreadID))
-                    threadToProcess[evt.NewThreadID] = evt.NewProcessID;
-            }
-
-            // 上下文切换计数（仅统计被切出的用户态线程，排除系统进程）
-            var ctxCountByThread = new Dictionary<int, long>();
-            foreach (var evt in contextSwitchEvents)
-            {
-                int oldThread = evt.OldThreadID;
-                int oldProc = evt.OldProcessID;
-                if (oldThread > 0 && oldProc > 0) // 排除系统空闲线程（进程ID 0）
-                {
-                    if (!ctxCountByThread.ContainsKey(oldThread))
-                        ctxCountByThread[oldThread] = 0;
-                    ctxCountByThread[oldThread]++;
-                }
-            }
-
-            // DPC 时间按驱动汇总
-            var dpcTimeByModule = new Dictionary<string, long>();
-            foreach (var evt in dpcEvents)
-            {
-                if (evt.RoutineAddress.HasValue && evt.DPCTime.HasValue)
-                {
-                    ulong addr = evt.RoutineAddress.Value;
-                    string? driverName = null;
-                    // 查找包含该地址的驱动模块（优先匹配有 End 范围的，其次只匹配基址）
-                    foreach (var mapping in driverMappings)
-                    {
-                        if (mapping.End > 0)
-                        {
-                            if (addr >= mapping.Base && addr < mapping.End)
-                            {
-                                driverName = mapping.Name;
-                                break;
-                            }
-                        }
-                        else
-                        {
-                            // 没有大小信息，只能匹配基址相等（不精确，但作为后备）
-                            if (addr == mapping.Base)
-                            {
-                                driverName = mapping.Name;
-                                break;
-                            }
-                        }
-                    }
-                    if (driverName != null)
-                    {
-                        long ns = (long)evt.DPCTime.Value;
-                        if (!dpcTimeByModule.ContainsKey(driverName))
-                            dpcTimeByModule[driverName] = 0;
-                        dpcTimeByModule[driverName] += ns;
-                    }
-                }
-            }
-
-            // 中断时间按驱动汇总（可选）
-            var interruptTimeByModule = new Dictionary<string, double>();
-            foreach (var evt in interruptEvents)
-            {
-                if (evt.RoutineAddress.HasValue && evt.InterruptTime.HasValue)
-                {
-                    ulong addr = evt.RoutineAddress.Value;
-                    string? driverName = null;
-                    foreach (var mapping in driverMappings)
-                    {
-                        if (mapping.End > 0)
-                        {
-                            if (addr >= mapping.Base && addr < mapping.End)
-                            {
-                                driverName = mapping.Name;
-                                break;
-                            }
-                        }
-                        else if (addr == mapping.Base)
-                        {
-                            driverName = mapping.Name;
-                            break;
-                        }
-                    }
-                    if (driverName != null)
-                    {
-                        if (!interruptTimeByModule.ContainsKey(driverName))
-                            interruptTimeByModule[driverName] = 0;
-                        interruptTimeByModule[driverName] += evt.InterruptTime.Value;
-                    }
-                }
-            }
-
-            // 磁盘 I/O 总延迟（使用 double 累积）
-            var diskTotalLatencyMs = new Dictionary<int, double>();
-            foreach (var evt in diskIOReadEvents)
-            {
-                if (evt.ProcessID > 0 && evt.ElapsedTimeMSec.HasValue && evt.ElapsedTimeMSec.Value > 5)
-                {
-                    if (!diskTotalLatencyMs.ContainsKey(evt.ProcessID))
-                        diskTotalLatencyMs[evt.ProcessID] = 0;
-                    diskTotalLatencyMs[evt.ProcessID] += evt.ElapsedTimeMSec.Value;
-                }
-            }
-            foreach (var evt in diskIOWriteEvents)
-            {
-                if (evt.ProcessID > 0 && evt.ElapsedTimeMSec.HasValue && evt.ElapsedTimeMSec.Value > 5)
-                {
-                    if (!diskTotalLatencyMs.ContainsKey(evt.ProcessID))
-                        diskTotalLatencyMs[evt.ProcessID] = 0;
-                    diskTotalLatencyMs[evt.ProcessID] += evt.ElapsedTimeMSec.Value;
-                }
-            }
-
-            data.ProcessNames = processNames;
-            data.ProcessPaths = processPaths;
-            data.ThreadToProcess = threadToProcess;
-            data.ContextSwitchCountByThread = ctxCountByThread;
-            data.DPCTimeByModule = dpcTimeByModule;
-            data.InterruptTimeByModule = interruptTimeByModule;
-            data.DiskIOTotalLatencyMs = diskTotalLatencyMs;
-            data.CollectionDurationMs = (long)duration.TotalMilliseconds;
+            return string.IsNullOrEmpty(path) ? name : $"{name} ({path})";
         }
 
-        return data;
-    }
+        // 找出上下文切换速率最高的进程（排除 Idle 和 System，若数据不足则回退）
+        var topCtx = ctxCountByProcess
+            .Where(kv => kv.Key != 0 && kv.Key != 4)
+            .OrderByDescending(kv => kv.Value)
+            .FirstOrDefault();
+        if (topCtx.Key == 0 && ctxCountByProcess.Count > 0)
+            topCtx = ctxCountByProcess.OrderByDescending(kv => kv.Value).First();
 
-    private static string Analyze(KernelData data)
-    {
-        double durationSec = data.CollectionDurationMs / 1000.0;
+        double ctxRate = topCtx.Value / sec;
 
-        // 聚合上下文切换到进程
-        var ctxByProcess = new Dictionary<int, long>();
-        foreach (var kv in data.ContextSwitchCountByThread)
-        {
-            if (data.ThreadToProcess.TryGetValue(kv.Key, out int pid))
-            {
-                if (!ctxByProcess.ContainsKey(pid))
-                    ctxByProcess[pid] = 0;
-                ctxByProcess[pid] += kv.Value;
-            }
-        }
+        // DPC 频率最高的驱动
+        var topDpc = dpcCountByDriver.OrderByDescending(kv => kv.Value).FirstOrDefault();
+        double dpcRate = topDpc.Value / sec;
 
-        int topCtxPid = 0;
-        double topCtxRate = 0;
-        foreach (var kv in ctxByProcess)
-        {
-            double rate = kv.Value / durationSec;
-            if (rate > topCtxRate)
-            {
-                topCtxRate = rate;
-                topCtxPid = kv.Key;
-            }
-        }
+        // 磁盘延迟最高的进程（排除 Idle 和 System）
+        var topDisk = diskLatencyByProcess
+            .Where(kv => kv.Key != 0 && kv.Key != 4)
+            .OrderByDescending(kv => kv.Value)
+            .FirstOrDefault();
+        if (topDisk.Key == 0 && diskLatencyByProcess.Count > 0)
+            topDisk = diskLatencyByProcess.OrderByDescending(kv => kv.Value).First();
 
-        // DPC
-        string topDpcModule = "";
-        long topDpcTime = 0;
-        foreach (var kv in data.DPCTimeByModule)
-        {
-            if (kv.Value > topDpcTime)
-            {
-                topDpcTime = kv.Value;
-                topDpcModule = kv.Key;
-            }
-        }
+        double diskLatency = topDisk.Value;
 
-        // Interrupt（可选，如果DPC没找到但中断很高则用）
-        string topIntModule = "";
-        double topIntTime = 0;
-        foreach (var kv in data.InterruptTimeByModule)
+        // 诊断逻辑
+        if (ctxRate > 5000 && topCtx.Key != 0 && topCtx.Key != 4)
         {
-            if (kv.Value > topIntTime)
-            {
-                topIntTime = kv.Value;
-                topIntModule = kv.Key;
-            }
+            return $"LAG DETECTED: \"{GetProcessDescription(topCtx.Key)}\" is causing {ctxRate:F0} context switches/sec.\n→ Try closing or uninstalling this software.";
         }
-
-        // 磁盘总延迟
-        int topDiskPid = 0;
-        double topDiskLatencyMs = 0;
-        foreach (var kv in data.DiskIOTotalLatencyMs)
+        else if (dpcRate > 3000 && topDpc.Value > 0)
         {
-            if (kv.Value > topDiskLatencyMs)
-            {
-                topDiskLatencyMs = kv.Value;
-                topDiskPid = kv.Key;
-            }
+            return $"LAG DETECTED: Driver \"{topDpc.Key}\" is causing {dpcRate:F0} DPCs/sec.\n→ Update, disable, or uninstall the associated device/software.";
         }
-
-        string GetProcessDesc(int pid)
+        else if (diskLatency > 500 && topDisk.Key != 0 && topDisk.Key != 4)
         {
-            if (pid <= 0) return "System Idle";
-            if (pid == 4) return "System Process (PID 4)";
-            string name = data.ProcessNames.GetValueOrDefault(pid, $"PID {pid}");
-            string path = data.ProcessPaths.GetValueOrDefault(pid, "");
-            if (!string.IsNullOrEmpty(path))
-                return $"{name} ({path})";
-            return name;
-        }
-
-        const double HighCtxRate = 5000;
-        const long HighDpcNs = 50_000_000;      // 50ms in 10 sec
-        const double HighIntMs = 50.0;          // 50ms in 10 sec
-        const double HighDiskLatencyMs = 500.0;
-
-        if (topCtxRate > HighCtxRate && topCtxPid != 0)
-        {
-            string culprit = GetProcessDesc(topCtxPid);
-            return $"LAG DETECTED: \"{culprit}\" is causing excessive thread context switching ({topCtxRate:F0} switches/sec).\n→ Try closing or uninstalling this software.";
-        }
-        else if (topDpcTime > HighDpcNs && !string.IsNullOrEmpty(topDpcModule))
-        {
-            string softwareHint = MapDriverToSoftware(topDpcModule);
-            return $"LAG DETECTED: Driver \"{topDpcModule}\" is causing high DPC latency (total {topDpcTime / 1_000_000:F1} ms in 10 sec).\n{softwareHint}\n→ Try updating, disabling, or uninstalling the associated software.";
-        }
-        else if (topIntTime > HighIntMs && !string.IsNullOrEmpty(topIntModule))
-        {
-            string softwareHint = MapDriverToSoftware(topIntModule);
-            return $"LAG DETECTED: Driver \"{topIntModule}\" is causing high interrupt time (total {topIntTime:F1} ms in 10 sec).\n{softwareHint}\n→ Try updating, disabling, or uninstalling the associated software.";
-        }
-        else if (topDiskLatencyMs > HighDiskLatencyMs && topDiskPid != 0)
-        {
-            string culprit = GetProcessDesc(topDiskPid);
-            return $"LAG DETECTED: \"{culprit}\" is causing slow disk I/O (total {topDiskLatencyMs:F0} ms of delay in 10 seconds).\n→ Check if it's scanning files or downloading. Try pausing or uninstalling it.";
+            return $"LAG DETECTED: \"{GetProcessDescription(topDisk.Key)}\" is causing {diskLatency:F0} ms total disk delay.\n→ Check its disk activity or pause it.";
         }
         else
         {
-            return "No clear culprit detected in 10 seconds. Possible causes:\n- Lagging software was idle during sampling.\n- Hardware issue (thermal throttling, failing drive).\n- Multiple low-impact programs combined.\nTry running this tool again while the lag is happening.";
+            if (topCtx.Key == 4 && ctxRate > 5000)
+                return $"High context switching in System process ({ctxRate:F0}/s). This often indicates a kernel/driver issue.\n→ Use LatencyMon to identify the offending driver.";
+            if (topDisk.Key == 4 && diskLatency > 500)
+                return $"High disk latency in System process ({diskLatency:F0} ms). Kernel-mode activities may be responsible.\n→ Use Process Monitor or LatencyMon for deeper analysis.";
+            return "No clear culprit detected. Try running again while lag is happening.\nYou may also use LatencyMon for deeper driver analysis.";
         }
     }
-
-    private static string MapDriverToSoftware(string driverName)
-    {
-        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
-        {
-            { "npcap.sys", "Likely from Npcap/Wireshark." },
-            { "PROCEXP152.sys", "From Sysinternals Process Explorer." },
-            { "protect.sys", "Often part of game anti-cheat or malware." },
-            { "hook.sys", "Suspicious driver, possibly keylogger or cheat." },
-            { "rtwlanu.sys", "Realtek wireless driver. Try updating." },
-            { "nvlddmkm.sys", "NVIDIA driver. Try updating or lowering graphics." },
-            { "atikmdag.sys", "AMD driver. Update recommended." }
-        };
-        string baseName = Path.GetFileName(driverName);
-        if (map.TryGetValue(baseName, out string? desc))
-            return desc;
-        return $"Search online for '{baseName}' to find which software it belongs to.";
-    }
-
-    private static bool IsAdministrator()
-    {
-        using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
-        var principal = new System.Security.Principal.WindowsPrincipal(identity);
-        return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
-    }
-}
-
-class KernelData
-{
-    public Dictionary<int, string> ProcessNames { get; set; } = new();
-    public Dictionary<int, string> ProcessPaths { get; set; } = new();
-    public Dictionary<int, int> ThreadToProcess { get; set; } = new();
-    public Dictionary<int, long> ContextSwitchCountByThread { get; set; } = new();
-    public Dictionary<string, long> DPCTimeByModule { get; set; } = new();
-    public Dictionary<string, double> InterruptTimeByModule { get; set; } = new();
-    public Dictionary<int, double> DiskIOTotalLatencyMs { get; set; } = new();
-    public long CollectionDurationMs { get; set; }
-}
-
-internal static class NativeMethods
-{
-    [DllImport("psapi.dll", SetLastError = true)]
-    public static extern bool EnumDeviceDrivers(IntPtr[] lpImageBase, int cb, ref int lpcbNeeded);
-
-    [DllImport("psapi.dll", SetLastError = true)]
-    public static extern bool GetDeviceDriverFileName(IntPtr ImageBase, byte[] lpFilename, int nSize);
 }
