@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Microsoft.Diagnostics.Tracing;
 using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using Microsoft.Diagnostics.Tracing.Session;
@@ -9,7 +10,6 @@ class Program
 {
     static async Task Main()
     {
-        // 权限检查
         if (TraceEventSession.IsElevated() == false)
         {
             Console.WriteLine("Please run as Administrator.");
@@ -51,7 +51,6 @@ class Program
 
     static async Task<string> CollectAndAnalyzeAsync(TimeSpan duration, CancellationToken token)
     {
-        // 聚合数据结构
         var ctxCountByProcess = new Dictionary<int, long>();
         var dpcCountByDriver = new Dictionary<string, long>();
         var diskLatencyByProcess = new Dictionary<int, double>();
@@ -59,16 +58,13 @@ class Program
         var driverMap = new Dictionary<ulong, (ulong End, string Name)>();
 
         using var session = new TraceEventSession(KernelTraceEventParser.KernelSessionName, TraceEventSessionOptions.Create);
-        session.EnableKernelProvider(
-            KernelTraceEventParser.Keywords.ContextSwitch |
-            KernelTraceEventParser.Keywords.DeferredProcedureCalls |   // 修正：DPC → DeferredProcedureCalls
-            KernelTraceEventParser.Keywords.DiskIO |
-            KernelTraceEventParser.Keywords.ImageLoad
-        );
+        
+        // 启用所有内核事件，确保 CSwitch 和 DPC 必定被捕获
+        session.EnableKernelProvider(KernelTraceEventParser.Keywords.All);
 
         var parser = new KernelTraceEventParser(session.Source);
 
-        // 1. 模块加载
+        // ---------- 模块加载（强类型，无问题）----------
         void OnImageLoad(ImageLoadTraceData evt)
         {
             if (evt.ImageBase == 0 || evt.ImageSize <= 0 || string.IsNullOrEmpty(evt.FileName))
@@ -82,26 +78,14 @@ class Program
         parser.ImageLoad += OnImageLoad;
         parser.ImageDCStart += OnImageLoad;
 
-        // 2. 上下文切换（修正：CSwitch → ContextSwitch，类型 ContextSwitchTraceData）
-        parser.ContextSwitch += (ContextSwitchTraceData evt) =>
-        {
-            int pid = evt.OldProcessID;
-            if (pid > 0)
-            {
-                ctxCountByProcess.TryGetValue(pid, out long cur);
-                ctxCountByProcess[pid] = cur + 1;
-                if (!processNames.ContainsKey(pid) && !string.IsNullOrEmpty(evt.ProcessName))
-                    processNames[pid] = evt.ProcessName;
-            }
-        };
-
-        // 3. 磁盘 I/O
+        // ---------- 磁盘 I/O（强类型，已验证可用）----------
         void OnDiskIO(DiskIOTraceData evt)
         {
             if (evt.ProcessID > 0 && evt.ElapsedTimeMSec > 1.0)
             {
                 diskLatencyByProcess.TryGetValue(evt.ProcessID, out double cur);
                 diskLatencyByProcess[evt.ProcessID] = cur + evt.ElapsedTimeMSec;
+
                 if (!processNames.ContainsKey(evt.ProcessID) && !string.IsNullOrEmpty(evt.ProcessName))
                     processNames[evt.ProcessID] = evt.ProcessName;
             }
@@ -109,24 +93,46 @@ class Program
         parser.DiskIORead += OnDiskIO;
         parser.DiskIOWrite += OnDiskIO;
 
-        // 4. DPC（修正：DPC → DPCEvent）
-        parser.DPCEvent += (DPCTraceData evt) =>
+        // ---------- 上下文切换 与 DPC（使用动态事件，绕过版本 API 差异）----------
+        session.Source.Dynamic.All += (TraceEvent evt) =>
         {
-            ulong addr = evt.Routine;
-            if (addr == 0) return;
-            string? driver = null;
-            foreach (var kv in driverMap)
+            // 只处理我们需要的事件，忽略其他（包括已强类型处理的 DiskIO）
+            if (evt.EventName == "CSwitch")
             {
-                if (addr >= kv.Key && addr < kv.Value.End)
+                int oldPid = (int)evt.PayloadByName("OldProcessID");
+                if (oldPid > 0)
                 {
-                    driver = kv.Value.Name;
-                    break;
+                    ctxCountByProcess.TryGetValue(oldPid, out long cur);
+                    ctxCountByProcess[oldPid] = cur + 1;
+
+                    if (!processNames.ContainsKey(oldPid))
+                    {
+                        string? name = evt.PayloadByName("ProcessName") as string;
+                        if (!string.IsNullOrEmpty(name))
+                            processNames[oldPid] = name;
+                    }
                 }
             }
-            if (driver != null)
+            else if (evt.EventName == "DPC")
             {
-                dpcCountByDriver.TryGetValue(driver, out long cur);
-                dpcCountByDriver[driver] = cur + 1;
+                ulong addr = (ulong)evt.PayloadByName("Routine");
+                if (addr == 0) return;
+
+                string? driver = null;
+                foreach (var kv in driverMap)
+                {
+                    if (addr >= kv.Key && addr < kv.Value.End)
+                    {
+                        driver = kv.Value.Name;
+                        break;
+                    }
+                }
+
+                if (driver != null)
+                {
+                    dpcCountByDriver.TryGetValue(driver, out long cur);
+                    dpcCountByDriver[driver] = cur + 1;
+                }
             }
         };
 
@@ -142,6 +148,7 @@ class Program
             try { await processTask; } catch (OperationCanceledException) { }
         }
 
+        // ---------- 分析逻辑（与之前完全相同）----------
         double sec = duration.TotalSeconds;
 
         string GetProcessDescription(int pid)
