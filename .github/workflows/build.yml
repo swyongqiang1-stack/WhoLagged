@@ -1,39 +1,33 @@
 name: Build and Publish WhoLagged
-
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: windows-latest
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
-
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
         dotnet-version: '8.0.x'
-
     - name: Restore dependencies
       run: dotnet restore
-
     - name: Publish
       run: >
         dotnet publish
         -c Release
         -r win-x64
         --self-contained true
-        -p:PublishSingleFile=true
         -o ./publish
-
+    - name: Zip publish folder
+      run: Compress-Archive -Path ./publish/* -DestinationPath ./WhoLagged.zip
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        name: WhoLagged-exe
-        path: ./publish/WhoLagged.exe
+        name: WhoLagged
+        path: ./WhoLagged.zip
