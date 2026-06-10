@@ -41,8 +41,9 @@ class Program
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"\nERROR: {ex.Message}");
-            Console.WriteLine("Close other monitoring tools (LatencyMon, WPR, etc.) and try again.");
+            // 输出完整异常信息，方便定位问题
+            Console.WriteLine($"\nERROR:\n{ex}");
+            Console.WriteLine("\nClose other monitoring tools (LatencyMon, WPR, etc.) and try again.");
         }
 
         Console.WriteLine("\nPress any key to exit.");
@@ -58,13 +59,17 @@ class Program
         var driverMap = new Dictionary<ulong, (ulong End, string Name)>();
 
         using var session = new TraceEventSession(KernelTraceEventParser.KernelSessionName, TraceEventSessionOptions.Create);
-        
-        // 启用所有内核事件，确保 CSwitch 和 DPC 必定被捕获
-        session.EnableKernelProvider(KernelTraceEventParser.Keywords.All);
+
+        // 使用精确的关键字，避免 Keywords.All 可能引起的提供商初始化失败
+        session.EnableKernelProvider(
+            KernelTraceEventParser.Keywords.ContextSwitch |
+            KernelTraceEventParser.Keywords.ImageLoad |
+            KernelTraceEventParser.Keywords.DiskIO
+        );
 
         var parser = new KernelTraceEventParser(session.Source);
 
-        // ---------- 模块加载（强类型，无问题）----------
+        // ---------- 模块加载 ----------
         void OnImageLoad(ImageLoadTraceData evt)
         {
             if (evt.ImageBase == 0 || evt.ImageSize <= 0 || string.IsNullOrEmpty(evt.FileName))
@@ -76,9 +81,10 @@ class Program
             driverMap[evt.ImageBase] = (end, driverName);
         }
         parser.ImageLoad += OnImageLoad;
-        parser.ImageDCStart += OnImageLoad;
+        // 暂时注释掉 ImageDCStart，避免部分系统不支持的 Rundown 事件导致错误
+        // parser.ImageDCStart += OnImageLoad;
 
-        // ---------- 磁盘 I/O（强类型，已验证可用）----------
+        // ---------- 磁盘 I/O ----------
         void OnDiskIO(DiskIOTraceData evt)
         {
             if (evt.ProcessID > 0 && evt.ElapsedTimeMSec > 1.0)
@@ -93,10 +99,9 @@ class Program
         parser.DiskIORead += OnDiskIO;
         parser.DiskIOWrite += OnDiskIO;
 
-        // ---------- 上下文切换 与 DPC（使用动态事件，绕过版本 API 差异）----------
+        // ---------- 上下文切换（动态事件）----------
         session.Source.Dynamic.All += (TraceEvent evt) =>
         {
-            // 只处理我们需要的事件，忽略其他（包括已强类型处理的 DiskIO）
             if (evt.EventName == "CSwitch")
             {
                 int oldPid = (int)evt.PayloadByName("OldProcessID");
@@ -113,27 +118,28 @@ class Program
                     }
                 }
             }
-            else if (evt.EventName == "DPC")
-            {
-                ulong addr = (ulong)evt.PayloadByName("Routine");
-                if (addr == 0) return;
-
-                string? driver = null;
-                foreach (var kv in driverMap)
-                {
-                    if (addr >= kv.Key && addr < kv.Value.End)
-                    {
-                        driver = kv.Value.Name;
-                        break;
-                    }
-                }
-
-                if (driver != null)
-                {
-                    dpcCountByDriver.TryGetValue(driver, out long cur);
-                    dpcCountByDriver[driver] = cur + 1;
-                }
-            }
+            // DPC 部分暂时禁用，待核心功能跑通后再启用
+            // else if (evt.EventName == "DPC")
+            // {
+            //     var routineObj = evt.PayloadByName("Routine");
+            //     if (routineObj == null) return;
+            //     ulong addr = Convert.ToUInt64(routineObj);
+            //     if (addr == 0) return;
+            //     string? driver = null;
+            //     foreach (var kv in driverMap)
+            //     {
+            //         if (addr >= kv.Key && addr < kv.Value.End)
+            //         {
+            //             driver = kv.Value.Name;
+            //             break;
+            //         }
+            //     }
+            //     if (driver != null)
+            //     {
+            //         dpcCountByDriver.TryGetValue(driver, out long cur);
+            //         dpcCountByDriver[driver] = cur + 1;
+            //     }
+            // }
         };
 
         var processTask = Task.Run(() => session.Source.Process(), token);
@@ -148,7 +154,7 @@ class Program
             try { await processTask; } catch (OperationCanceledException) { }
         }
 
-        // ---------- 分析逻辑（与之前完全相同）----------
+        // ---------- 分析逻辑 ----------
         double sec = duration.TotalSeconds;
 
         string GetProcessDescription(int pid)
@@ -176,6 +182,7 @@ class Program
             topCtx = ctxCountByProcess.OrderByDescending(kv => kv.Value).First();
         double ctxRate = topCtx.Value / sec;
 
+        // DPC 数据为空时，topDpc 将不会产生有效信息
         var topDpc = dpcCountByDriver.OrderByDescending(kv => kv.Value).FirstOrDefault();
         double dpcRate = topDpc.Value / sec;
 
