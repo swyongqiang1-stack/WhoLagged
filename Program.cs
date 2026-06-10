@@ -4,7 +4,7 @@ using Microsoft.Diagnostics.Tracing.Parsers;
 using Microsoft.Diagnostics.Tracing.Parsers.Kernel;
 using Microsoft.Diagnostics.Tracing.Session;
 
-namespace StutterFix;
+namespace WhoLagged;
 
 class Program
 {
@@ -17,7 +17,7 @@ class Program
             return;
         }
 
-        Console.WriteLine("===== StutterFix - Find the software causing lag =====");
+        Console.WriteLine("===== WhoLagged - Find the software causing lag =====");
         Console.WriteLine("Sampling for 10 seconds... (Keep your PC in laggy state)");
         Console.WriteLine("Press Ctrl+C to cancel early.\n");
 
