@@ -57,14 +57,14 @@ class Program
         var diskLatencyByProcess = new Dictionary<int, double>();  // PID -> 磁盘延迟总和(ms)
         var processNames = new Dictionary<int, string>();          // PID -> 进程名
 
-        // 驱动地址映射（实时维护，ImageLoad/DCStart 事件会动态添加）
+        // 驱动地址映射（实时维护）
         var driverMap = new Dictionary<ulong, (ulong End, string Name)>();
 
-        // ----- 创建会话并启用内核提供程序 -----
+        // 创建会话并启用内核提供程序
         using var session = new TraceEventSession(KernelTraceEventParser.KernelSessionName, TraceEventSessionOptions.Create);
         session.EnableKernelProvider(
             KernelTraceEventParser.Keywords.ContextSwitch |
-            KernelTraceEventParser.Keywords.DPC |
+            KernelTraceEventParser.Keywords.DeferredProcedureCalls |  // 修正：DPC → DeferredProcedureCalls
             KernelTraceEventParser.Keywords.DiskIO |
             KernelTraceEventParser.Keywords.ImageLoad
         );
@@ -80,15 +80,15 @@ class Program
                 return;
             string driverName = Path.GetFileName(evt.FileName);
             if (string.IsNullOrEmpty(driverName))
-                return;                                      // 拒绝空名称
+                return;
             ulong end = evt.ImageBase + (ulong)evt.ImageSize;
-            driverMap[evt.ImageBase] = (end, driverName);    // 自动去重
+            driverMap[evt.ImageBase] = (end, driverName);
         }
         parser.ImageLoad += OnImageLoad;
-        parser.ImageDCStart += OnImageLoad;                  // 已加载的驱动也会触发
+        parser.ImageDCStart += OnImageLoad;
 
-        // 2. 上下文切换
-        parser.CSwitch += (CSwitchTraceData evt) =>
+        // 2. 上下文切换（修正事件名和类型）
+        parser.ContextSwitch += (ContextSwitchTraceData evt) =>
         {
             int pid = evt.OldProcessID;
             if (pid > 0)
@@ -101,7 +101,7 @@ class Program
             }
         };
 
-        // 3. 磁盘 I/O（只累加延迟，不记录路径）
+        // 3. 磁盘 I/O
         void OnDiskIO(DiskIOTraceData evt)
         {
             if (evt.ProcessID > 0 && evt.ElapsedTimeMSec > 1.0)
@@ -116,8 +116,8 @@ class Program
         parser.DiskIORead += OnDiskIO;
         parser.DiskIOWrite += OnDiskIO;
 
-        // 4. DPC：实时遍历 driverMap 匹配驱动名（线性扫描，适合数百个驱动的场景）
-        parser.DPC += (DPCTraceData evt) =>
+        // 4. DPC（修正事件名）
+        parser.DPCEvent += (DPCTraceData evt) =>
         {
             ulong addr = evt.Routine;
             if (addr == 0) return;
@@ -148,7 +148,6 @@ class Program
         }
         finally
         {
-            // 确保取消或异常时也能正确停止会话
             session.Stop();
             try { await processTask; } catch (OperationCanceledException) { }
         }
@@ -156,7 +155,6 @@ class Program
         // ----- 分析阶段 -----
         double sec = duration.TotalSeconds;
 
-        // 辅助函数：安全获取进程描述（诊断时才获取路径，避免高频回调中开销过大）
         string GetProcessDescription(int pid)
         {
             if (pid == 0) return "System Idle Process";
@@ -171,12 +169,11 @@ class Program
                 if (!processNames.ContainsKey(pid))
                     name = p.ProcessName;
             }
-            catch { } // 权限不足或进程已退出时忽略
+            catch { }
 
             return string.IsNullOrEmpty(path) ? name : $"{name} ({path})";
         }
 
-        // 找出上下文切换速率最高的进程（排除 Idle 和 System，若数据不足则回退）
         var topCtx = ctxCountByProcess
             .Where(kv => kv.Key != 0 && kv.Key != 4)
             .OrderByDescending(kv => kv.Value)
@@ -186,11 +183,9 @@ class Program
 
         double ctxRate = topCtx.Value / sec;
 
-        // DPC 频率最高的驱动
         var topDpc = dpcCountByDriver.OrderByDescending(kv => kv.Value).FirstOrDefault();
         double dpcRate = topDpc.Value / sec;
 
-        // 磁盘延迟最高的进程（排除 Idle 和 System）
         var topDisk = diskLatencyByProcess
             .Where(kv => kv.Key != 0 && kv.Key != 4)
             .OrderByDescending(kv => kv.Value)
@@ -200,7 +195,6 @@ class Program
 
         double diskLatency = topDisk.Value;
 
-        // 诊断逻辑
         if (ctxRate > 5000 && topCtx.Key != 0 && topCtx.Key != 4)
         {
             return $"LAG DETECTED: \"{GetProcessDescription(topCtx.Key)}\" is causing {ctxRate:F0} context switches/sec.\n→ Try closing or uninstalling this software.";
