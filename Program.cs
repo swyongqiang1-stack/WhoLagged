@@ -41,7 +41,6 @@ class Program
         }
         catch (Exception ex)
         {
-            // 输出完整异常（包括 Win32Exception 等）
             Console.WriteLine($"\nFATAL ERROR:\n{ex}");
             Console.WriteLine("\n📌 Troubleshooting:");
             Console.WriteLine(" - Close LatencyMon, WPR, PerfView, Process Explorer and try again.");
@@ -56,12 +55,12 @@ class Program
     static async Task<string> CollectAndAnalyzeAsync(TimeSpan duration, CancellationToken token)
     {
         var ctxCountByProcess = new Dictionary<int, long>();
-        var dpcCountByDriver = new Dictionary<string, long>();      // DPC 暂未启用
+        var dpcCountByDriver = new Dictionary<string, long>();
         var diskLatencyByProcess = new Dictionary<int, double>();
         var processNames = new Dictionary<int, string>();
         var driverMap = new Dictionary<ulong, (ulong End, string Name)>();
 
-        // ---------- 检测 ETW 内核会话是否被占用 ----------
+        // 检测内核会话是否被占用
         try
         {
             using var testSession = new TraceEventSession(KernelTraceEventParser.KernelSessionName);
@@ -77,19 +76,17 @@ class Program
 
         using var session = new TraceEventSession(KernelTraceEventParser.KernelSessionName, TraceEventSessionOptions.Create);
 
-        // 阶段 1：先启用最稳定的关键字（ContextSwitch + DiskIO）
+        // 启用所有需要的提供程序（已验证 ContextSwitch 和 DiskIO 可用，现在增加 ImageLoad 和 DPC）
         session.EnableKernelProvider(
             KernelTraceEventParser.Keywords.ContextSwitch |
-            KernelTraceEventParser.Keywords.DiskIO
-            // 阶段 2 可添加 ImageLoad
-            // | KernelTraceEventParser.Keywords.ImageLoad
-            // 阶段 3 可添加 DPC
-            // | KernelTraceEventParser.Keywords.DeferredProcedureCalls
+            KernelTraceEventParser.Keywords.DiskIO |
+            KernelTraceEventParser.Keywords.ImageLoad |
+            KernelTraceEventParser.Keywords.DeferredProcedureCalls   // DPC 的正确关键字
         );
 
         var parser = new KernelTraceEventParser(session.Source);
 
-        // ---------- 模块加载（待启用 ImageLoad 关键字后生效）----------
+        // ---------- 模块加载（构建驱动地址映射）----------
         void OnImageLoad(ImageLoadTraceData evt)
         {
             if (evt.ImageBase == 0 || evt.ImageSize <= 0 || string.IsNullOrEmpty(evt.FileName))
@@ -100,8 +97,8 @@ class Program
             ulong end = evt.ImageBase + (ulong)evt.ImageSize;
             driverMap[evt.ImageBase] = (end, driverName);
         }
-        // 当前未启用 ImageLoad 关键字，暂不挂载
-        // parser.ImageLoad += OnImageLoad;
+        parser.ImageLoad += OnImageLoad;
+        // ImageDCStart 在某些系统上可能引发问题，暂时继续注释
         // parser.ImageDCStart += OnImageLoad;
 
         // ---------- 磁盘 I/O ----------
@@ -119,7 +116,7 @@ class Program
         parser.DiskIORead += OnDiskIO;
         parser.DiskIOWrite += OnDiskIO;
 
-        // ---------- 上下文切换（动态事件）----------
+        // ---------- 上下文切换 与 DPC（动态事件）----------
         session.Source.Dynamic.All += (TraceEvent evt) =>
         {
             if (evt.EventName == "CSwitch")
@@ -138,15 +135,29 @@ class Program
                     }
                 }
             }
-            // DPC 事件待启用关键字后取消注释
-            // else if (evt.EventName == "DPC")
-            // {
-            //     var routineObj = evt.PayloadByName("Routine");
-            //     if (routineObj == null) return;
-            //     ulong addr = Convert.ToUInt64(routineObj);
-            //     if (addr == 0) return;
-            //     ……
-            // }
+            else if (evt.EventName == "DPC")
+            {
+                var routineObj = evt.PayloadByName("Routine");
+                if (routineObj == null) return;
+                ulong addr = Convert.ToUInt64(routineObj);
+                if (addr == 0) return;
+
+                string? driver = null;
+                foreach (var kv in driverMap)
+                {
+                    if (addr >= kv.Key && addr < kv.Value.End)
+                    {
+                        driver = kv.Value.Name;
+                        break;
+                    }
+                }
+
+                if (driver != null)
+                {
+                    dpcCountByDriver.TryGetValue(driver, out long cur);
+                    dpcCountByDriver[driver] = cur + 1;
+                }
+            }
         };
 
         var processTask = Task.Run(() => session.Source.Process(), token);
@@ -189,7 +200,6 @@ class Program
             topCtx = ctxCountByProcess.OrderByDescending(kv => kv.Value).First();
         double ctxRate = topCtx.Value / sec;
 
-        // DPC 暂未采集，值均为 0
         var topDpc = dpcCountByDriver.OrderByDescending(kv => kv.Value).FirstOrDefault();
         double dpcRate = topDpc.Value / sec;
 
@@ -201,6 +211,7 @@ class Program
             topDisk = diskLatencyByProcess.OrderByDescending(kv => kv.Value).First();
         double diskLatency = topDisk.Value;
 
+        // 诊断输出
         if (ctxRate > 5000 && topCtx.Key != 0 && topCtx.Key != 4)
         {
             return $"LAG DETECTED: \"{GetProcessDescription(topCtx.Key)}\" is causing {ctxRate:F0} context switches/sec.\n→ Try closing or uninstalling this software.";
