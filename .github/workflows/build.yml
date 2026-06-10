@@ -1,10 +1,12 @@
 name: Build and Publish WhoLagged
+
 on:
   push:
     branches: [ main ]
   pull_request:
     branches: [ main ]
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: windows-latest
