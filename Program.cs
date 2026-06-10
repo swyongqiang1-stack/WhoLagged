@@ -9,7 +9,7 @@ class Program
 {
     static async Task Main()
     {
-        // 权限检查：明确未提权时才提示
+        // 权限检查
         if (TraceEventSession.IsElevated() == false)
         {
             Console.WriteLine("Please run as Administrator.");
@@ -52,28 +52,23 @@ class Program
     static async Task<string> CollectAndAnalyzeAsync(TimeSpan duration, CancellationToken token)
     {
         // 聚合数据结构
-        var ctxCountByProcess = new Dictionary<int, long>();       // PID -> 上下文切换次数
-        var dpcCountByDriver = new Dictionary<string, long>();     // 驱动名 -> DPC 次数
-        var diskLatencyByProcess = new Dictionary<int, double>();  // PID -> 磁盘延迟总和(ms)
-        var processNames = new Dictionary<int, string>();          // PID -> 进程名
-
-        // 驱动地址映射（实时维护）
+        var ctxCountByProcess = new Dictionary<int, long>();
+        var dpcCountByDriver = new Dictionary<string, long>();
+        var diskLatencyByProcess = new Dictionary<int, double>();
+        var processNames = new Dictionary<int, string>();
         var driverMap = new Dictionary<ulong, (ulong End, string Name)>();
 
-        // 创建会话并启用内核提供程序
         using var session = new TraceEventSession(KernelTraceEventParser.KernelSessionName, TraceEventSessionOptions.Create);
         session.EnableKernelProvider(
             KernelTraceEventParser.Keywords.ContextSwitch |
-            KernelTraceEventParser.Keywords.DeferredProcedureCalls |  // 修正：DPC → DeferredProcedureCalls
+            KernelTraceEventParser.Keywords.DeferredProcedureCalls |   // 修正：DPC → DeferredProcedureCalls
             KernelTraceEventParser.Keywords.DiskIO |
             KernelTraceEventParser.Keywords.ImageLoad
         );
 
         var parser = new KernelTraceEventParser(session.Source);
 
-        // ----- 事件回调 -----
-
-        // 1. 模块加载（构建驱动地址映射，过滤空名称）
+        // 1. 模块加载
         void OnImageLoad(ImageLoadTraceData evt)
         {
             if (evt.ImageBase == 0 || evt.ImageSize <= 0 || string.IsNullOrEmpty(evt.FileName))
@@ -87,7 +82,7 @@ class Program
         parser.ImageLoad += OnImageLoad;
         parser.ImageDCStart += OnImageLoad;
 
-        // 2. 上下文切换（修正事件名和类型）
+        // 2. 上下文切换（修正：CSwitch → ContextSwitch，类型 ContextSwitchTraceData）
         parser.ContextSwitch += (ContextSwitchTraceData evt) =>
         {
             int pid = evt.OldProcessID;
@@ -95,7 +90,6 @@ class Program
             {
                 ctxCountByProcess.TryGetValue(pid, out long cur);
                 ctxCountByProcess[pid] = cur + 1;
-
                 if (!processNames.ContainsKey(pid) && !string.IsNullOrEmpty(evt.ProcessName))
                     processNames[pid] = evt.ProcessName;
             }
@@ -108,7 +102,6 @@ class Program
             {
                 diskLatencyByProcess.TryGetValue(evt.ProcessID, out double cur);
                 diskLatencyByProcess[evt.ProcessID] = cur + evt.ElapsedTimeMSec;
-
                 if (!processNames.ContainsKey(evt.ProcessID) && !string.IsNullOrEmpty(evt.ProcessName))
                     processNames[evt.ProcessID] = evt.ProcessName;
             }
@@ -116,12 +109,11 @@ class Program
         parser.DiskIORead += OnDiskIO;
         parser.DiskIOWrite += OnDiskIO;
 
-        // 4. DPC（修正事件名）
+        // 4. DPC（修正：DPC → DPCEvent）
         parser.DPCEvent += (DPCTraceData evt) =>
         {
             ulong addr = evt.Routine;
             if (addr == 0) return;
-
             string? driver = null;
             foreach (var kv in driverMap)
             {
@@ -131,7 +123,6 @@ class Program
                     break;
                 }
             }
-
             if (driver != null)
             {
                 dpcCountByDriver.TryGetValue(driver, out long cur);
@@ -139,7 +130,6 @@ class Program
             }
         };
 
-        // 启动事件处理线程
         var processTask = Task.Run(() => session.Source.Process(), token);
 
         try
@@ -152,14 +142,12 @@ class Program
             try { await processTask; } catch (OperationCanceledException) { }
         }
 
-        // ----- 分析阶段 -----
         double sec = duration.TotalSeconds;
 
         string GetProcessDescription(int pid)
         {
             if (pid == 0) return "System Idle Process";
             if (pid == 4) return "System (Kernel)";
-
             string name = processNames.TryGetValue(pid, out var n) ? n : $"PID {pid}";
             string path = "";
             try
@@ -170,7 +158,6 @@ class Program
                     name = p.ProcessName;
             }
             catch { }
-
             return string.IsNullOrEmpty(path) ? name : $"{name} ({path})";
         }
 
@@ -180,7 +167,6 @@ class Program
             .FirstOrDefault();
         if (topCtx.Key == 0 && ctxCountByProcess.Count > 0)
             topCtx = ctxCountByProcess.OrderByDescending(kv => kv.Value).First();
-
         double ctxRate = topCtx.Value / sec;
 
         var topDpc = dpcCountByDriver.OrderByDescending(kv => kv.Value).FirstOrDefault();
@@ -192,7 +178,6 @@ class Program
             .FirstOrDefault();
         if (topDisk.Key == 0 && diskLatencyByProcess.Count > 0)
             topDisk = diskLatencyByProcess.OrderByDescending(kv => kv.Value).First();
-
         double diskLatency = topDisk.Value;
 
         if (ctxRate > 5000 && topCtx.Key != 0 && topCtx.Key != 4)
