@@ -35,14 +35,13 @@ It attempts to determine:
 
 ## Technical Approach
 
-WhoLagged is built on Windows Event Tracing for Windows (ETW) and collects kernel-level telemetry, including:
+WhoLagged uses Windows kernel event tracing to analyze system-level scheduling and I/O behavior.
 
-- Context switch events
-- Disk I/O latency events
-- DPC (Deferred Procedure Call) activity
-- Kernel image load events
+It collects high-frequency runtime telemetry and performs in-memory aggregation to detect performance anomalies such as CPU scheduling pressure, driver-induced latency, and disk I/O stalls.
 
-All data is processed in real time and aggregated in memory to minimize overhead.
+The system focuses on identifying performance bottlenecks through behavioral patterns rather than raw resource usage metrics.
+
+All processing is performed in real time with minimal overhead to avoid interfering with system behavior during analysis.
 
 ## Requirements
 
